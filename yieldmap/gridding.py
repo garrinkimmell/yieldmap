@@ -2,6 +2,9 @@ import h5py
 import numpy as np
 import numpy.ma as ma
 from scipy import spatial
+from scipy.spatial.distance import pdist
+from collections import defaultdict
+
 import shapely
 from shapely.geometry import Polygon
 from shapely.ops import cascaded_union
@@ -32,7 +35,6 @@ class FieldGrid(object):
             ymax = max(self._df.Northing)
             self._bounds = (xmin, ymin, xmax, ymax)
         return self._bounds
-
 
 
     @property
@@ -71,37 +73,46 @@ class FieldGrid(object):
         circum_r = max(a,b,c)
         return circum_r
 
-    def boundary_polygon(self, alpha=1200):
-        points = self._df[['Easting','Northing']].values
+    def boundary_polygon(self, alpha=30):
+        points = self._df[['Easting', 'Northing']].values
         # print 'Calculating Tesselation'
-        tri = spatial.Delaunay(points,qhull_options='Qbb Qt Fv')
+        tri = spatial.Delaunay(points, qhull_options='Qbb Qt Fv')
         # print 'Done calculating Tesselation.'
 
-        count = 0
+        vpoints = points[tri.simplices]
 
+        # We add an additional element to the end, because the
+        # neighbors array in the tesselation uses `-1` to indicate
+        # that a simplex edge is part of the convex hull. In our check below,
+        # this means that this will map to a dead 'simplex', and will properly
+        # indicate this to be a border simplex.
+        dead = np.array([np.max(pdist(i)) for i in vpoints] + [alpha + 1]) > alpha
+        s = tri.simplices
+        sindices = xrange(s.shape[0])
 
-        polys = []
-        alphas = []
-        for ia, ib, ic in tri.vertices:
-            pa = points[ia]
-            pb = points[ib]
-            pc = points[ic]
-            circum_r = self.alpharadius(pa,pb,pc)
-            # alphas.append(circum_r)
-            # Here's the radius filter.
-            if circum_r < alpha:
-                count += 1
-                pts = [points[idx] for idx in [ia,ib,ic,ia]]
-                poly = shapely.geometry.Polygon(pts)
+        # Find the perimeter edges.
 
-                if poly.is_valid:
-                    polys.append(poly)
-                else:
-                    print "Invalid polygon"
+        # d is a dictionary that maps a point index to a list of neighbor point indices
+        d = defaultdict(list)
+        for simplex in sindices:
+            if dead[simplex]:
+                continue
+            # TODO: Not needed once the cascaded union code has been
+            # removed.
+            if not np.any(dead[tri.neighbors[simplex]]):
+                continue
+            for vindex in xrange(3):
+                if dead[tri.neighbors[simplex, vindex]]:
+                    v1 = s[simplex, (vindex+1) % 3]
+                    v2 = s[simplex, (vindex+2) % 3]
+                    d[v1].append(v2)
 
-        outside = cascaded_union(polys)
-        # Dilate to incorporate header width
-        # Width is in inches, convert to meters.
+        rings = [shapely.geometry.LinearRing(points[c]) for c in chains(d)]
+        exteriors = [r for r in rings if r.is_ccw]
+        interiors = [r for r in rings if not r.is_ccw]
+        outers = cascaded_union([shapely.geometry.Polygon(e) for e in exteriors])
+        holes = cascaded_union([shapely.geometry.Polygon(i) for i in interiors])
+        outside = outers.difference(holes)
         outside = outside.buffer(self._df['Width'].max() / 39.37)
 
         # print 'Finished calculating boundary'
@@ -112,7 +123,7 @@ class FieldGrid(object):
         outside = self.outside
         scale = float(1) / self.stride
 
-        (xmin,ymin,xmax,ymax) = self.bounds
+        (xmin, ymin, xmax, ymax) = self.bounds
         # print 'Making mask with bounds %s' % (self.bounds,)
         xtrans = -xmin
         ytrans = -ymin
@@ -215,6 +226,57 @@ class FieldGridGroupBy():
 
     def __len__(self):
         return len(self.cache)
+
+
+def chains(d):
+    """
+    Given a directed graph `d`, `chains` will return a list of all
+    simple loops in the graph. A path is a loop if it begins and ends
+    at the same node. A looping path is simple if it does not contain any
+    shorter loops.
+    """
+    chains = []
+    deadchains = []
+    visited = set()
+
+    def search(node, accum=[]):
+        """
+        `search` will enumerate all 'loops' in the adjacency graph,
+        starting from the given node. It will add each loop to the
+        list of `chains`. Those that are bogus (non-looping) chains
+        will be appended to `deadchains`.
+
+        """
+        if len(d[node]) > 1:
+            visited.add(node)
+            for nxt in d[node]:
+                search(nxt, accum=accum + [node])
+        elif node in visited:
+            # print 'At visited node %s' % node
+            ar = accum[::-1]
+            try:
+                i = ar.index(node)
+                a = ar[:i+1]
+                chains.append(a[::-1] + [node])
+            except:
+                print "Can't find node %s in %s" % (node, [])
+                deadchains.append(accum + [node])
+        else:
+            visited.add(node)
+            search(d[node][0], accum=accum + [node])
+
+    u = d.copy()
+    while u.keys():
+        start = u.keys()[0]
+        search(start)
+        for i in visited:
+            try:
+                del u[i]
+            except:
+                pass
+
+    return chains
+
 
 
 
